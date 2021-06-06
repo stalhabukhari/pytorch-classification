@@ -10,12 +10,14 @@ import shutil
 import time
 import random
 
+import numpy as np
+from sklearn.model_selection import train_test_split
+
 import torch
 import torch.nn as nn
-import torch.nn.parallel
-import torch.backends.cudnn as cudnn
-import torch.optim as optim
+import torch.nn.functional as F
 import torch.utils.data as data
+from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import models.cifar as models
@@ -28,6 +30,9 @@ model_names = sorted(name for name in models.__dict__
     and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR10/100 Training')
+# Mode (train/test)
+parser.add_argument("--train", action="store_true")
+parser.add_argument("--test", action="store_true")
 # Datasets
 parser.add_argument('-d', '--dataset', default='cifar10', type=str)
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
@@ -72,14 +77,19 @@ parser.add_argument('--growthRate', type=int, default=12, help='Growth rate for 
 parser.add_argument('--compressionRate', type=int, default=2, help='Compression Rate (theta) for DenseNet.')
 # Miscs
 parser.add_argument('--manualSeed', type=int, help='manual seed')
-parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
-                    help='evaluate model on validation set')
+parser.add_argument('--loadModel', type=str, default='model_best.pth.tar')
+# parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
+#                     help='evaluate model on validation set')
 #Device options
 parser.add_argument('--gpu-id', default='0', type=str,
                     help='id(s) for CUDA_VISIBLE_DEVICES')
 
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
+
+# Mode (train/test)
+assert args.train or args.test
+assert not (args.train and args.test)
 
 # Validate dataset
 assert args.dataset == 'cifar10' or args.dataset == 'cifar100', 'Dataset can only be cifar10 or cifar100.'
@@ -95,8 +105,10 @@ random.seed(args.manualSeed)
 torch.manual_seed(args.manualSeed)
 if use_cuda:
     torch.cuda.manual_seed_all(args.manualSeed)
+    torch.backends.cudnn.benchmark = True
 
 best_acc = 0  # best test accuracy
+abs_step_count = 0 # count training iterations
 
 def main():
     global best_acc
@@ -127,12 +139,33 @@ def main():
         dataloader = datasets.CIFAR100
         num_classes = 100
 
+    if args.train:
+        trainset = dataloader(root='./data', train=True, download=True, transform=transform_train)
+        train_idx, valid_idx = train_test_split(
+            np.arange(len(trainset.targets)),
+            test_size=0.1,
+            shuffle=True,
+            stratify=trainset.targets,
+            random_state=args.manualSeed)
 
-    trainset = dataloader(root='./data', train=True, download=True, transform=transform_train)
-    trainloader = data.DataLoader(trainset, batch_size=args.train_batch, shuffle=True, num_workers=args.workers)
+        # valid_size = 0.1 # 10%
+        # indices = list(range(len(trainset)))
+        # split = int(np.floor(valid_size * len(trainset)))
+        # np.random.seed(args.manualSeed)
+        # np.random.shuffle(indices)
+        # train_idx, valid_idx = indices[split:], indices[:split]
+        trainset_train = data.Subset(trainset, train_idx) # training set
+        trainset_valid = data.Subset(trainset, valid_idx) # validation set
 
-    testset = dataloader(root='./data', train=False, download=False, transform=transform_test)
-    testloader = data.DataLoader(testset, batch_size=args.test_batch, shuffle=False, num_workers=args.workers)
+        trainloader_all = data.DataLoader(trainset, batch_size=args.train_batch, shuffle=True, num_workers=args.workers)
+        trainloader = data.DataLoader(trainset_train, batch_size=args.train_batch, shuffle=True, num_workers=args.workers)
+        validloader = data.DataLoader(trainset_valid, batch_size=args.train_batch, shuffle=True, num_workers=args.workers)
+        print(f' Data size: {len(trainset)} | Train Set: {len(trainset_train)} | Valid Set: {len(trainset_valid)} ')
+
+    if args.test:
+        testset = dataloader(root='./data', train=False, download=True, transform=transform_test)
+        testloader = data.DataLoader(testset, batch_size=args.test_batch, shuffle=False, num_workers=args.workers)
+        print(f' Test Set size: {len(testset)}')
 
     # Model
     print("==> creating model '{}'".format(args.arch))
@@ -169,66 +202,93 @@ def main():
         model = models.__dict__[args.arch](num_classes=num_classes)
 
     model = torch.nn.DataParallel(model).cuda()
-    cudnn.benchmark = True
     print('    Total params: %.2fM' % (sum(p.numel() for p in model.parameters())/1000000.0))
+
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
-    # Resume
-    title = 'cifar-10-' + args.arch
-    if args.resume:
-        # Load checkpoint.
-        print('==> Resuming from checkpoint..')
-        assert os.path.isfile(args.resume), 'Error: no checkpoint directory found!'
-        args.checkpoint = os.path.dirname(args.resume)
-        checkpoint = torch.load(args.resume)
-        best_acc = checkpoint['best_acc']
-        start_epoch = checkpoint['epoch']
-        model.load_state_dict(checkpoint['state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title, resume=True)
-    else:
-        logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title)
-        logger.set_names(['Learning Rate', 'Train Loss', 'Valid Loss', 'Train Acc.', 'Valid Acc.'])
+    if args.test:
+        loaded_ckpt = load_checkpoint(checkpoint=args.checkpoint, filename=args.loadModel)
+        model.load_state_dict(loaded_ckpt['model_state'])
 
-
-    if args.evaluate:
-        print('\nEvaluation only')
-        test_loss, test_acc = test(testloader, model, criterion, start_epoch, use_cuda)
+        test_loss, test_acc = test(testloader, model, criterion, None, use_cuda)
         print(' Test Loss:  %.8f, Test Acc:  %.2f' % (test_loss, test_acc))
-        return
 
-    # Train and val
-    for epoch in range(start_epoch, args.epochs):
-        adjust_learning_rate(optimizer, epoch)
+    if args.train:
+        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
-        print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
+        # tensorboard writer:
+        tbwriter = SummaryWriter(log_dir=args.checkpoint) # read from config
+        # log graph to tensorboard:
+        with torch.no_grad():
+            tbwriter.add_graph(model, torch.zeros(5, 3, 32, 32).cuda())
+        print('Created TensorBoard instance')
 
-        train_loss, train_acc = train(trainloader, model, criterion, optimizer, epoch, use_cuda)
-        test_loss, test_acc = test(testloader, model, criterion, epoch, use_cuda)
+        # Resume
+        title = 'cifar-10-' + args.arch
+        if args.resume:
+            # Load checkpoint.
+            print('==> Resuming from checkpoint..')
+            assert os.path.isfile(args.resume), 'Error: no checkpoint directory found!'
+            args.checkpoint = os.path.dirname(args.resume)
+            checkpoint = torch.load(args.resume)
+            best_acc = checkpoint['best_acc']
+            start_epoch = checkpoint['epoch']
+            model.load_state_dict(checkpoint['state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title, resume=True)
+        else:
+            logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title)
+            logger.set_names(['Learning Rate', 'Train Loss', 'Valid Loss', 'Train Acc.', 'Valid Acc.'])
 
-        # append logger file
-        logger.append([state['lr'], train_loss, test_loss, train_acc, test_acc])
 
-        # save model
-        is_best = test_acc > best_acc
-        best_acc = max(test_acc, best_acc)
-        save_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': model.state_dict(),
-                'acc': test_acc,
-                'best_acc': best_acc,
-                'optimizer' : optimizer.state_dict(),
-            }, is_best, checkpoint=args.checkpoint)
+        # Train and Validate
+        for epoch in range(start_epoch, args.epochs):
+            adjust_learning_rate(optimizer, epoch)
 
-    logger.close()
-    logger.plot()
-    savefig(os.path.join(args.checkpoint, 'log.eps'))
+            print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
 
-    print('Best acc:')
-    print(best_acc)
+            if epoch+1==args.epochs: # final epoch
+                print('>> Training over the complete training dataset')
+                train_loss, train_acc = train(trainloader_all, model, criterion, optimizer, epoch, use_cuda) # ,tbwriter)
+            else:
+                train_loss, train_acc = train(trainloader, model, criterion, optimizer, epoch, use_cuda) # ,tbwriter)
+            test_loss, test_acc = test(validloader, model, criterion, epoch, use_cuda)
 
-def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
+            # append logger file
+            logger.append([state['lr'], train_loss, test_loss, train_acc, test_acc])
+
+            hist_dict = {
+                'loss/train': train_loss,
+                'loss/valid': test_loss,
+                'acc/train': train_acc,
+                'acc/valid': test_acc,
+            }
+            lr_dict = dict((f'lr_epoch/group_{g}', param_grp['lr']) \
+                        for g, param_grp in enumerate(optimizer.param_groups))
+            hist_dict.update(lr_dict)
+
+            log_to_tensorboard(tbwriter, hist_dict, epoch)
+
+            # save model
+            is_best = test_acc > best_acc
+            best_acc = max(test_acc, best_acc)
+            save_checkpoint({
+                    'epoch': epoch + 1,
+                    'model_state': model.state_dict(),
+                    'acc': test_acc,
+                    'best_acc': best_acc,
+                    'opt_state' : optimizer.state_dict(),
+                }, is_best, checkpoint=args.checkpoint)
+
+        logger.close()
+        logger.plot()
+        savefig(os.path.join(args.checkpoint, 'log.eps'))
+
+        print('Best acc:')
+        print(best_acc)
+
+
+def train(trainloader, model, criterion, optimizer, epoch, use_cuda, tbwriter=None):
     # switch to train mode
     model.train()
 
@@ -245,18 +305,28 @@ def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
         data_time.update(time.time() - end)
 
         if use_cuda:
-            inputs, targets = inputs.cuda(), targets.cuda(async=True)
-        inputs, targets = torch.autograd.Variable(inputs), torch.autograd.Variable(targets)
+            inputs, targets = inputs.cuda(), targets.cuda(non_blocking=True)
+        #inputs, targets = torch.autograd.Variable(inputs), torch.autograd.Variable(targets)
+        if tbwriter:
+            lr_dict = dict((f'lr_epoch/group_{g}', param_grp['lr']) \
+                        for g, param_grp in enumerate(optimizer.param_groups))
+            log_to_tensorboard(tbwriter, lr_dict, abs_step_count)
+            abs_step_count += 1
 
         # compute output
         outputs = model(inputs)
-        loss = criterion(outputs, targets)
+        if isinstance(outputs, tuple):
+            loss = sum(criterion(out_i, targets) for out_i in outputs)
+        else:
+            loss = criterion(outputs, targets)
 
         # measure accuracy and record loss
+        if isinstance(outputs, tuple): # average outputs (ensemble)
+            outputs = sum(F.softmax(out_i, dim=1) for out_i in outputs)/float(len(outputs))
         prec1, prec5 = accuracy(outputs.data, targets.data, topk=(1, 5))
-        losses.update(loss.data[0], inputs.size(0))
-        top1.update(prec1[0], inputs.size(0))
-        top5.update(prec5[0], inputs.size(0))
+        losses.update(loss.item(), inputs.size(0))
+        top1.update(prec1.item(), inputs.size(0))
+        top5.update(prec5.item(), inputs.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -283,7 +353,7 @@ def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
     bar.finish()
     return (losses.avg, top1.avg)
 
-def test(testloader, model, criterion, epoch, use_cuda):
+def test(testloader, model, criterion, epoch, use_cuda, tbwriter=None):
     global best_acc
 
     batch_time = AverageMeter()
@@ -303,17 +373,21 @@ def test(testloader, model, criterion, epoch, use_cuda):
 
         if use_cuda:
             inputs, targets = inputs.cuda(), targets.cuda()
-        inputs, targets = torch.autograd.Variable(inputs, volatile=True), torch.autograd.Variable(targets)
 
         # compute output
         outputs = model(inputs)
-        loss = criterion(outputs, targets)
+        if isinstance(outputs, tuple):
+            loss = sum(criterion(out_i, targets) for out_i in outputs)
+        else:
+            loss = criterion(outputs, targets)
 
         # measure accuracy and record loss
+        if isinstance(outputs, tuple): # average outputs (ensemble)
+            outputs = sum(F.softmax(out_i, dim=1) for out_i in outputs)/float(len(outputs))
         prec1, prec5 = accuracy(outputs.data, targets.data, topk=(1, 5))
-        losses.update(loss.data[0], inputs.size(0))
-        top1.update(prec1[0], inputs.size(0))
-        top5.update(prec5[0], inputs.size(0))
+        losses.update(loss.item(), inputs.size(0))
+        top1.update(prec1.item(), inputs.size(0))
+        top5.update(prec5.item(), inputs.size(0))
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -341,12 +415,23 @@ def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoin
     if is_best:
         shutil.copyfile(filepath, os.path.join(checkpoint, 'model_best.pth.tar'))
 
+def load_checkpoint(checkpoint='checkpoint', filename='model_best.pth.tar'):
+    assert '.pth.tar' in filename
+    filepath = os.path.join(checkpoint, filename)
+    return torch.load(filepath)
+
 def adjust_learning_rate(optimizer, epoch):
     global state
     if epoch in args.schedule:
         state['lr'] *= args.gamma
         for param_group in optimizer.param_groups:
             param_group['lr'] = state['lr']
+
+def log_to_tensorboard(writer, scalar_dict, step):
+    """routine for tensorboard logging"""
+    for key in scalar_dict:
+        writer.add_scalar(key, scalar_dict[key], step)
+
 
 if __name__ == '__main__':
     main()

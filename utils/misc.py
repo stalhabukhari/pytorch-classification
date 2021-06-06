@@ -7,13 +7,13 @@ import errno
 import os
 import sys
 import time
-import math
+import math, csv
 
 import torch.nn as nn
 import torch.nn.init as init
 from torch.autograd import Variable
 
-__all__ = ['get_mean_and_std', 'init_params', 'mkdir_p', 'AverageMeter']
+__all__ = ['get_mean_and_std', 'init_params', 'mkdir_p', 'AverageMeter', 'CSVLogger']
 
 
 def get_mean_and_std(dataset):
@@ -74,3 +74,35 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
+
+
+class CSVLogger(object):
+    def __init__(self, path, fields=None):
+        if fields is None:
+            fields = ['Arch', 'Dataset', 'CheckpointPath', 'LoadModel',
+                    'Loss', 'Top1Acc', 'Top5Acc']
+        self.fields = fields
+        if not os.path.isfile(path):
+            self.write_to_csv(None, path, write_header=True)
+        self.path = path
+
+    def __call__(self, data_row):
+        self.check_keys(data_row, self.fields)
+        self.write_to_csv(data_row, self.path)
+
+    def write_to_csv(self, data_row, file_name, write_header=False):
+        write_mode = 'w' if write_header else 'a'
+        with open(file_name, mode=write_mode, newline='') as file:
+            file_writer = csv.DictWriter(file, fieldnames=self.fields)
+            if write_header:
+                file_writer.writeheader()
+            else:
+                file_writer.writerow(data_row)
+
+    @staticmethod
+    def check_keys(dc_in, l_ref):
+        """"""
+        lin, lref = list(dc_in.keys()), list(l_ref)
+        lin.sort()
+        lref.sort()
+        assert lin == lref
